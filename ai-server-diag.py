@@ -57,6 +57,60 @@ def human(n):
 # System info
 # -----------------------------
 
+def parse_cpu_list(cpulist):
+    """Convert cpulist like '0-7,16-23' into a list of ints."""
+    cpus = []
+    for part in cpulist.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            cpus.extend(range(int(a), int(b) + 1))
+        else:
+            cpus.append(int(part))
+    return sorted(cpus)
+
+
+def score_numa_nodes(numa, cpu_info):
+    """
+    Score NUMA nodes based on:
+    - Local memory
+    - Number of cores
+    - L3 cache per core (if available)
+    """
+    results = []
+
+    # Extract L3 size in KB
+    l3_kb = None
+    if cpu_info.get("l3_kb"):
+        try:
+            l3_kb = int(cpu_info["l3_kb"].replace("K", "").replace("KB", "").strip())
+        except Exception:
+            pass
+
+    for node in numa["detail"]:
+        cpus = parse_cpu_list(node["cpus"])
+        core_count = len(cpus)
+        mem_gb = (node["mem_kb"] or 0) / (1024**2)
+
+        # Basic scoring
+        score = core_count * 1.0 + mem_gb * 0.5
+
+        # Bonus for large L3 per core
+        if l3_kb:
+            score += (l3_kb / 1024) / max(core_count, 1)
+
+        results.append({
+            "node": node["id"],
+            "cpus": cpus,
+            "core_count": core_count,
+            "mem_gb": mem_gb,
+            "score": score,
+        })
+
+    # Sort by score descending
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+
 def get_cpu_info():
     info = {
         "model": None,
@@ -213,6 +267,39 @@ def recommend_model(cpu, mem, caps, mem_bw):
 
     return feasible[-1], tps
 
+def generate_numa_pinning(best_node):
+    """
+    Produce:
+    - numactl command
+    - taskset mask
+    - recommended thread count
+    """
+    cpus = best_node["cpus"]
+    cpu_range = f"{cpus[0]}-{cpus[-1]}"
+    threads = len(cpus)
+
+    numactl_cmd = (
+        f"numactl --cpunodebind={best_node['node']} "
+        f"--membind={best_node['node']}"
+    )
+
+    taskset_cmd = f"taskset -c {cpu_range}"
+
+    example_llama = (
+        f"{numactl_cmd} {taskset_cmd} "
+        f"./llama-cli -m model.gguf -t {threads}"
+    )
+
+    return {
+        "node": best_node["node"],
+        "cpu_range": cpu_range,
+        "threads": threads,
+        "numactl": numactl_cmd,
+        "taskset": taskset_cmd,
+        "example": example_llama,
+    }
+
+
 # -----------------------------
 # Tuning script
 # -----------------------------
@@ -264,6 +351,23 @@ def generate_report(cpu, mem, numa, gpu, caps, pybench, mbw, model, tps):
     lines.append(f"- Nodes: {numa['nodes']}")
     for n in numa["detail"]:
         lines.append(f"  - Node {n['id']}: CPUs {n['cpus']}, Mem {human(n['mem_kb']*1024)}")
+    lines.append("")
+
+    # NUMA pinning recommendation
+    lines.append("## NUMA‑Aware CPU Pinning Recommendation")
+    
+    best_nodes = score_numa_nodes(numa, cpu)
+    best = best_nodes[0]
+    pin = generate_numa_pinning(best)
+    
+    lines.append(f"- Best NUMA node: **{pin['node']}**")
+    lines.append(f"- CPU range: `{pin['cpu_range']}`")
+    lines.append(f"- Recommended threads: `{pin['threads']}`")
+    lines.append("")
+    lines.append("### Suggested command")
+    lines.append("```bash")
+    lines.append(pin["example"])
+    lines.append("```")
     lines.append("")
 
     lines.append("## Benchmarks")
