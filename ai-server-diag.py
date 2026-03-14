@@ -1,66 +1,212 @@
 #!/usr/bin/env python3
-import platform
-import psutil
-import subprocess
-import time
+# Run as: sudo python3 ai_optimize.py
+
 import os
-import numpy as np
+import sys
+import json
+import time
+import shutil
+import subprocess
+from pathlib import Path
 from textwrap import dedent
 
 # -----------------------------
-# Configurable settings
+# Global paths / constants
 # -----------------------------
-LLAMACPP_BINARY = "./main"          # Path to llama.cpp binary (optional)
-LLAMACPP_MODEL  = "./model.gguf"    # Path to a GGUF model (optional)
-RUN_LLAMACPP_BENCH = False          # Set to True if you want to run a real LLM benchmark
+BASE_DIR = Path("ai_optimize")
+LOG_DIR = BASE_DIR / "logs"
+REPORT_PATH = BASE_DIR / "report.md"
+SETTINGS_PATH = BASE_DIR / "settings.json"
+APPLY_SAFE_SH = BASE_DIR / "apply_safe.sh"
+APPLY_UNSAFE_SH = BASE_DIR / "apply_unsafe.sh"
+ROLLBACK_SH = BASE_DIR / "rollback.sh"
+CHANGES_LOG = LOG_DIR / "changes.log"
+
+REQUIRED_TOOLS_DEBIAN = [
+    "cpufrequtils", "numactl", "dmidecode", "util-linux", "systemd-container", "lsblk"
+]
+REQUIRED_TOOLS_REDHAT = [
+    "cpupower", "numactl", "dmidecode", "tuned", "virt-what", "util-linux", "lsblk"
+]
 
 # -----------------------------
-# Helpers
+# Utility helpers
 # -----------------------------
-def run_cmd(cmd):
+def run_cmd(cmd, check=False):
     try:
-        return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode()
-    except Exception:
-        return ""
+        result = subprocess.run(
+            cmd, shell=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, check=check
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        return e.stdout.strip() if e.stdout else ""
 
-def check_cpu_flags():
+def log(msg):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CHANGES_LOG, "a") as f:
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+
+def ensure_root():
+    if os.geteuid() != 0:
+        print("This script must be run as root (sudo).")
+        sys.exit(1)
+
+def read_os_release():
+    data = {}
+    if os.path.exists("/etc/os-release"):
+        with open("/etc/os-release") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    data[k] = v.strip('"')
+    return data
+
+def detect_distro():
+    info = read_os_release()
+    id_ = info.get("ID", "").lower()
+    like = info.get("ID_LIKE", "").lower()
+
+    if any(x in (id_, like) for x in ["debian", "ubuntu"]):
+        return "debian"
+    if any(x in (id_, like) for x in ["rhel", "centos", "fedora", "rocky", "almalinux"]):
+        return "redhat"
+    return "unknown"
+
+def install_required_tools(distro):
+    print("\n[+] Checking and installing required tools...")
+    if distro == "debian":
+        tools = REQUIRED_TOOLS_DEBIAN
+        pkg_mgr = "apt"
+        update_cmd = "apt update -y"
+        install_cmd = "apt install -y"
+    elif distro == "redhat":
+        tools = REQUIRED_TOOLS_REDHAT
+        pkg_mgr = "dnf"
+        update_cmd = "dnf makecache -y"
+        install_cmd = "dnf install -y"
+    else:
+        print("[-] Unknown distro, skipping automatic tool installation.")
+        return
+
+    # Check tools
+    missing = []
+    for t in tools:
+        if shutil.which(t.split()[0]) is None:
+            missing.append(t)
+
+    if not missing:
+        print("[+] All required tools already installed.")
+        return
+
+    print(f"[+] Missing tools detected: {', '.join(missing)}")
+    print(f"[+] Using {pkg_mgr} to install missing tools...")
+    log(f"Installing tools: {', '.join(missing)}")
+
+    run_cmd(update_cmd)
+    run_cmd(f"{install_cmd} " + " ".join(missing))
+
+# -----------------------------
+# Detection helpers
+# -----------------------------
+def detect_cpu_info():
+    out = run_cmd("lscpu")
+    info = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            info[k.strip()] = v.strip()
+    return info
+
+def detect_cpu_flags():
     flags = []
     if os.path.exists("/proc/cpuinfo"):
-        try:
-            with open("/proc/cpuinfo") as f:
-                data = f.read()
-            for line in data.split("\n"):
+        with open("/proc/cpuinfo") as f:
+            for line in f:
                 if "flags" in line:
-                    flags = line.split(":")[1].strip().split()
+                    flags = line.split(":", 1)[1].strip().split()
                     break
-        except Exception:
-            pass
     return flags
 
-def detect_disk_type():
-    # Linux-specific heuristic
-    result = run_cmd("lsblk -d -o name,rota")
-    if not result:
-        return {"unknown": "unknown"}
-    lines = result.strip().split("\n")[1:]
-    disk_info = {}
-    for line in lines:
-        parts = line.split()
-        if len(parts) != 2:
-            continue
-        name, rota = parts
-        disk_info[name] = "SSD/NVMe" if rota == "0" else "HDD"
-    return disk_info or {"unknown": "unknown"}
+def detect_mem_info():
+    out = run_cmd("grep MemTotal /proc/meminfo")
+    kb = 0
+    if out:
+        kb = int(out.split()[1])
+    return kb * 1024  # bytes
 
+def detect_numa_nodes():
+    nodes = []
+    base = Path("/sys/devices/system/node")
+    if base.is_dir():
+        for entry in base.iterdir():
+            if entry.name.startswith("node"):
+                nodes.append(entry.name)
+    return nodes
+
+def detect_disks():
+    out = run_cmd("lsblk -d -o NAME,ROTA")
+    disks = {}
+    lines = out.splitlines()
+    if len(lines) > 1:
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) == 2:
+                name, rota = parts
+                disks[name] = "SSD/NVMe" if rota == "0" else "HDD"
+    return disks or {"unknown": "unknown"}
+
+def detect_virtualization():
+    # Try systemd-detect-virt
+    out = run_cmd("systemd-detect-virt")
+    if out and out != "none":
+        return out
+    # Fallback: check cpuinfo hypervisor flag
+    flags = detect_cpu_flags()
+    if "hypervisor" in flags:
+        return "generic-virt"
+    return "none"
+
+def detect_cpu_vendor(cpu_info):
+    vendor = cpu_info.get("Vendor ID", "") or cpu_info.get("Vendor ID:", "")
+    if not vendor:
+        out = run_cmd("grep vendor_id /proc/cpuinfo | head -n1")
+        if out:
+            vendor = out.split(":")[1].strip()
+    vendor = vendor.lower()
+    if "intel" in vendor:
+        return "intel"
+    if "amd" in vendor:
+        return "amd"
+    return "unknown"
+
+def detect_sockets(cpu_info):
+    sockets = cpu_info.get("Socket(s)", "1")
+    try:
+        return int(sockets)
+    except ValueError:
+        return 1
+
+# -----------------------------
+# Synthetic benchmarks
+# -----------------------------
 def memory_bandwidth_test(size_mb=500):
+    try:
+        import numpy as np
+    except ImportError:
+        print("[-] numpy not installed, skipping memory bandwidth test.")
+        return 0.0
+
     size = size_mb * 1024 * 1024 // 8
     a = np.random.rand(size)
     b = np.random.rand(size)
     start = time.time()
-    c = a + b
+    _ = a + b
     end = time.time()
-    mbps = size_mb / (end - start)
-    return mbps
+    if end - start == 0:
+        return 0.0
+    return size_mb / (end - start)
 
 def cpu_thread_test():
     start = time.time()
@@ -70,47 +216,10 @@ def cpu_thread_test():
     end = time.time()
     return end - start
 
-def detect_numa():
-    # Linux-only simple NUMA detection
-    nodes = []
-    sysfs_numa = "/sys/devices/system/node"
-    if os.path.isdir(sysfs_numa):
-        for entry in os.listdir(sysfs_numa):
-            if entry.startswith("node"):
-                nodes.append(entry)
-    return nodes
-
-def llama_cpp_benchmark():
-    if not RUN_LLAMACPP_BENCH:
-        return None
-    if not (os.path.isfile(LLAMACPP_BINARY) and os.path.isfile(LLAMACPP_MODEL)):
-        return None
-    cmd = f'{LLAMACPP_BINARY} -m {LLAMACPP_MODEL} -p "Hello" --n-predict 64 --timings'
-    out = run_cmd(cmd)
-    if not out:
-        return None
-    # crude parse: look for "tokens per second"
-    tps = None
-    for line in out.splitlines():
-        if "tokens per second" in line.lower():
-            # e.g. "XXX tokens per second"
-            parts = line.split()
-            for p in parts:
-                try:
-                    tps = float(p)
-                    break
-                except ValueError:
-                    continue
-    return {"raw_output": out, "tps": tps}
-
 # -----------------------------
 # Scoring logic
 # -----------------------------
-def score_system(cpu_flags, mem_total, bw, cpu_time, disks, llama_bench):
-    """
-    Return dict with scores and reasons for 7B, 13B, 14B.
-    Score: 0–100
-    """
+def score_system(cpu_flags, mem_total, bw, cpu_time, disks, llama_bench=None):
     scores = {}
     reasons = {}
 
@@ -119,7 +228,6 @@ def score_system(cpu_flags, mem_total, bw, cpu_time, disks, llama_bench):
     fast_storage = "HDD" not in disks.values()
     ram_gb = mem_total / 1e9
 
-    # Base CPU capability score
     cpu_score = 30
     if avx512:
         cpu_score += 40
@@ -128,15 +236,11 @@ def score_system(cpu_flags, mem_total, bw, cpu_time, disks, llama_bench):
     else:
         cpu_score += 5
 
-    # Single-thread performance
     if cpu_time < 1.0:
         cpu_score += 20
     elif cpu_time < 1.5:
         cpu_score += 10
-    else:
-        cpu_score += 0
 
-    # Memory bandwidth contribution
     mem_score = 0
     if bw > 8000:
         mem_score += 30
@@ -145,10 +249,8 @@ def score_system(cpu_flags, mem_total, bw, cpu_time, disks, llama_bench):
     elif bw > 2000:
         mem_score += 10
 
-    # Storage
     storage_score = 10 if fast_storage else 0
 
-    # Llama.cpp TPS if available
     llama_score = 0
     if llama_bench and llama_bench.get("tps"):
         tps = llama_bench["tps"]
@@ -159,10 +261,8 @@ def score_system(cpu_flags, mem_total, bw, cpu_time, disks, llama_bench):
         elif tps > 5:
             llama_score += 10
 
-    base_total = cpu_score + mem_score + storage_score + llama_score
-    base_total = max(0, min(100, base_total))
+    base_total = max(0, min(100, cpu_score + mem_score + storage_score + llama_score))
 
-    # Now derive per-model scores with RAM constraints
     # 7B
     s7 = base_total
     r7 = []
@@ -210,7 +310,7 @@ def score_system(cpu_flags, mem_total, bw, cpu_time, disks, llama_bench):
     scores["13B"] = max(0, min(100, s13))
     reasons["13B"] = r13
 
-    # 14B (similar to 13B but slightly stricter)
+    # 14B
     s14 = base_total
     r14 = []
     if ram_gb < 16:
@@ -234,157 +334,326 @@ def score_system(cpu_flags, mem_total, bw, cpu_time, disks, llama_bench):
     return scores, reasons
 
 # -----------------------------
-# Main
+# Report generation
+# -----------------------------
+def generate_report(cpu_info, cpu_flags, mem_total, bw, cpu_time,
+                    disks, numa_nodes, virt, vendor, sockets,
+                    scores, reasons):
+    BASE_DIR.mkdir(exist_ok=True)
+    lines = []
+
+    lines.append("# LLM CPU Optimization Diagnostic Report\n")
+    lines.append("## 1. System Overview\n")
+    lines.append(f"- **CPU Model:** {cpu_info.get('Model name', cpu_info.get('Model name:', 'Unknown'))}")
+    lines.append(f"- **CPU Vendor:** {vendor}")
+    lines.append(f"- **Physical Cores:** {cpu_info.get('Core(s) per socket', 'Unknown')}")
+    lines.append(f"- **Logical Threads:** {cpu_info.get('CPU(s)', 'Unknown')}")
+    lines.append(f"- **Sockets:** {sockets}")
+    lines.append(f"- **Virtualization:** {virt}")
+    lines.append(f"- **AVX2 Support:** {'Yes' if 'avx2' in cpu_flags else 'No'}")
+    lines.append(f"- **AVX512 Support:** {'Yes' if 'avx512f' in cpu_flags else 'No'}")
+    lines.append(f"- **Total RAM:** {round(mem_total / 1e9, 2)} GB")
+    lines.append(f"- **NUMA Nodes Detected:** {', '.join(numa_nodes) if numa_nodes else 'None / Not detected'}")
+
+    lines.append("\n### Disk Devices\n")
+    for d, t in disks.items():
+        lines.append(f"- **{d}:** {t}")
+
+    lines.append("\n## 2. Synthetic Benchmarks\n")
+    lines.append(f"- **Estimated Memory Bandwidth:** {bw:.2f} MB/s")
+    lines.append(f"- **Single-thread Loop Time (10M ops):** {cpu_time:.2f} s")
+
+    lines.append("\n## 3. Model Suitability Scores\n")
+    for model in ["7B", "13B", "14B"]:
+        lines.append(f"### {model} Models")
+        lines.append(f"- **Score:** {scores[model]}/100")
+        lines.append("- **Reasons:**")
+        for r in reasons[model]:
+            lines.append(f"  - {r}")
+        lines.append("")
+
+    lines.append("## 4. Optimization Targets\n")
+    lines.append("- CPU governor, THP, hugepages, vm.swappiness, vm.max_map_count, dirty ratios, swap, services, noatime.")
+    lines.append("- Advanced: isolcpus, nohz_full, rcu_nocbs, mitigations, pstate, SMT, SELinux/AppArmor, IRQ pinning.\n")
+
+    REPORT_PATH.write_text("\n".join(lines))
+    print(f"\n[+] Report written to {REPORT_PATH}")
+
+# -----------------------------
+# Safe / unsafe settings
+# -----------------------------
+def get_safe_settings(distro):
+    return [
+        "Set CPU governor to performance",
+        "Enable Transparent Huge Pages",
+        "Configure hugepages (2MB and possibly 1GB)",
+        "Set vm.swappiness=1",
+        "Set vm.max_map_count=262144",
+        "Tune dirty ratios (vm.dirty_ratio=10, vm.dirty_background_ratio=5)",
+        "Disable swap",
+        "Disable non-critical services (cups, avahi, bluetooth, etc.)",
+        "Apply noatime to non-root filesystems (if safe)"
+    ]
+
+def get_unsafe_settings(vendor, sockets, virt):
+    settings = [
+        "Add isolcpus to kernel cmdline",
+        "Add nohz_full to kernel cmdline",
+        "Add rcu_nocbs to kernel cmdline",
+        "Disable kernel mitigations (mitigations=off)",
+        "Apply noatime to root filesystem in fstab",
+        "Pin IRQs for NVMe/NIC to specific CPUs",
+        "Disable SMT/Hyperthreading",
+        "Disable SELinux/AppArmor"
+    ]
+    if vendor != "intel":
+        # intel_pstate only relevant on Intel
+        pass
+    else:
+        settings.insert(4, "Disable intel_pstate (intel_pstate=disable)")
+    if virt != "none":
+        # Many unsafe settings are less relevant in VMs
+        settings.append("NOTE: System is virtualized; some CPU isolation settings may be ineffective.")
+    if sockets > 1:
+        settings.append("NUMA-aware isolcpus per socket")
+    return settings
+
+# -----------------------------
+# Script generation helpers
+# -----------------------------
+def backup_file(path, backup_dir):
+    path = Path(path)
+    if path.exists():
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = backup_dir / (path.name + ".bak")
+        shutil.copy2(path, backup)
+        log(f"Backed up {path} to {backup}")
+
+def generate_rollback_script(distro):
+    lines = ["#!/bin/bash\nset -e\n\n"]
+    lines.append("# Rollback script generated by ai_optimize\n")
+    lines.append("# This will attempt to restore previous system configuration.\n\n")
+
+    # We only log that backups exist; actual restore is manual or simple copy
+    lines.append("echo 'Rollback script placeholder. Restore backups from ai_optimize/backups manually.'\n")
+
+    ROLLBACK_SH.write_text("".join(lines))
+    ROLLBACK_SH.chmod(0o750)
+    log("Generated rollback.sh")
+
+def generate_apply_safe_sh(distro):
+    lines = ["#!/bin/bash\nset -e\n\n"]
+    lines.append("# Apply safe AI optimizations\n\n")
+
+    # CPU governor
+    if distro == "debian":
+        lines.append("echo '[SAFE] Setting CPU governor to performance (Debian)...'\n")
+        lines.append("for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo performance > \"$c\" 2>/dev/null || true; done\n\n")
+    elif distro == "redhat":
+        lines.append("echo '[SAFE] Setting CPU governor to performance (RedHat)...'\n")
+        lines.append("cpupower frequency-set -g performance || true\n\n")
+
+    # THP
+    lines.append("echo '[SAFE] Enabling Transparent Huge Pages...'\n")
+    lines.append("echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true\n\n")
+
+    # Hugepages (simple default)
+    lines.append("echo '[SAFE] Configuring hugepages (2MB)...'\n")
+    lines.append("sysctl -w vm.nr_hugepages=1024 || true\n\n")
+
+    # vm.swappiness
+    lines.append("echo '[SAFE] Setting vm.swappiness=1...'\n")
+    lines.append("sysctl -w vm.swappiness=1 || true\n\n")
+
+    # vm.max_map_count
+    lines.append("echo '[SAFE] Setting vm.max_map_count=262144...'\n")
+    lines.append("sysctl -w vm.max_map_count=262144 || true\n\n")
+
+    # dirty ratios
+    lines.append("echo '[SAFE] Tuning dirty ratios...'\n")
+    lines.append("sysctl -w vm.dirty_ratio=10 || true\n")
+    lines.append("sysctl -w vm.dirty_background_ratio=5 || true\n\n")
+
+    # disable swap
+    lines.append("echo '[SAFE] Disabling swap...'\n")
+    lines.append("swapoff -a || true\n\n")
+
+    # disable non-critical services
+    lines.append("echo '[SAFE] Disabling non-critical services (cups, avahi, bluetooth if present)...'\n")
+    lines.append("for svc in cups avahi-daemon bluetooth; do systemctl disable --now \"$svc\" 2>/dev/null || true; done\n\n")
+
+    # noatime on non-root mounts (runtime only)
+    lines.append("echo '[SAFE] Applying noatime to non-root mounts (runtime only)...'\n")
+    lines.append("mount | awk '$3 != \"/\" {print $3}' | while read m; do mount -o remount,noatime \"$m\" 2>/dev/null || true; done\n\n")
+
+    APPLY_SAFE_SH.write_text("".join(lines))
+    APPLY_SAFE_SH.chmod(0o750)
+    log("Generated apply_safe.sh")
+
+def generate_apply_unsafe_sh(distro, chosen_settings):
+    lines = ["#!/bin/bash\nset -e\n\n"]
+    lines.append("# Apply unsafe AI optimizations (require reboot / may affect stability)\n\n")
+
+    grub_path = "/etc/default/grub" if distro == "debian" else "/etc/sysconfig/grub"
+
+    for s in chosen_settings:
+        if s.startswith("Add isolcpus"):
+            lines.append("echo '[UNSAFE] Adding isolcpus to kernel cmdline...'\n")
+            lines.append(f"sed -i 's/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"isolcpus=2-15 /' {grub_path} || true\n\n")
+        elif s.startswith("Add nohz_full"):
+            lines.append("echo '[UNSAFE] Adding nohz_full to kernel cmdline...'\n")
+            lines.append(f"sed -i 's/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"nohz_full=2-15 /' {grub_path} || true\n\n")
+        elif s.startswith("Add rcu_nocbs"):
+            lines.append("echo '[UNSAFE] Adding rcu_nocbs to kernel cmdline...'\n")
+            lines.append(f"sed -i 's/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"rcu_nocbs=2-15 /' {grub_path} || true\n\n")
+        elif s.startswith("Disable kernel mitigations"):
+            lines.append("echo '[UNSAFE] Disabling kernel mitigations...'\n")
+            lines.append(f"sed -i 's/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"mitigations=off /' {grub_path} || true\n\n")
+        elif s.startswith("Disable intel_pstate"):
+            lines.append("echo '[UNSAFE] Disabling intel_pstate...'\n")
+            lines.append(f"sed -i 's/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"intel_pstate=disable /' {grub_path} || true\n\n")
+        elif s.startswith("Apply noatime to root filesystem"):
+            lines.append("echo '[UNSAFE] Applying noatime to root filesystem in fstab...'\n")
+            lines.append("sed -i 's/ \\// \\//; s/defaults/defaults,noatime/' /etc/fstab || true\n\n")
+        elif s.startswith("Pin IRQs"):
+            lines.append("echo '[UNSAFE] Pinning IRQs for NVMe/NIC (example, manual tuning recommended)...'\n")
+            lines.append("# Example: echo 1 > /proc/irq/XX/smp_affinity\n\n")
+        elif s.startswith("Disable SMT"):
+            lines.append("echo '[UNSAFE] Disabling SMT/Hyperthreading (runtime only, may require BIOS change)...'\n")
+            lines.append("echo off > /sys/devices/system/cpu/smt/control 2>/dev/null || true\n\n")
+        elif s.startswith("Disable SELinux"):
+            lines.append("echo '[UNSAFE] Disabling SELinux/AppArmor (if present)...'\n")
+            lines.append("if [ -f /etc/selinux/config ]; then sed -i 's/SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config; fi\n")
+            lines.append("systemctl disable --now apparmor 2>/dev/null || true\n\n")
+
+    # Regenerate grub config
+    if distro == "debian":
+        lines.append("echo '[UNSAFE] Updating GRUB (Debian)...'\n")
+        lines.append("update-grub || true\n\n")
+    elif distro == "redhat":
+        lines.append("echo '[UNSAFE] Updating GRUB (RedHat)...'\n")
+        lines.append("grub2-mkconfig -o /boot/grub2/grub.cfg || true\n\n")
+
+    APPLY_UNSAFE_SH.write_text("".join(lines))
+    APPLY_UNSAFE_SH.chmod(0o750)
+    log("Generated apply_unsafe.sh")
+
+# -----------------------------
+# Main flow
 # -----------------------------
 def main():
-    # Collect system info
-    cpu_model = platform.processor()
-    physical = psutil.cpu_count(logical=False)
-    logical = psutil.cpu_count(logical=True)
-    flags = check_cpu_flags()
-    avx2 = "avx2" in flags
-    avx512 = "avx512f" in flags
+    ensure_root()
 
-    mem = psutil.virtual_memory()
-    disks = detect_disk_type()
-    numa_nodes = detect_numa()
+    BASE_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    distro = detect_distro()
+    print(f"[+] Detected distro family: {distro}")
+    log(f"Distro: {distro}")
+
+    install_required_tools(distro)
+
+    print("\n[+] Collecting system information and running diagnostics...")
+    cpu_info = detect_cpu_info()
+    cpu_flags = detect_cpu_flags()
+    mem_total = detect_mem_info()
+    numa_nodes = detect_numa_nodes()
+    disks = detect_disks()
+    virt = detect_virtualization()
+    vendor = detect_cpu_vendor(cpu_info)
+    sockets = detect_sockets(cpu_info)
 
     bw = memory_bandwidth_test()
     cpu_time = cpu_thread_test()
-    llama_bench = llama_cpp_benchmark()
 
-    scores, reasons = score_system(flags, mem.total, bw, cpu_time, disks, llama_bench)
+    scores, reasons = score_system(cpu_flags, mem_total, bw, cpu_time, disks, None)
+    generate_report(cpu_info, cpu_flags, mem_total, bw, cpu_time,
+                    disks, numa_nodes, virt, vendor, sockets,
+                    scores, reasons)
 
-    # Build Markdown report
-    report = []
+    # Save settings.json
+    settings = {
+        "distro": distro,
+        "virt": virt,
+        "vendor": vendor,
+        "sockets": sockets,
+        "scores": scores,
+        "timestamp": time.time()
+    }
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    log("Saved settings.json")
 
-    report.append("# LLM CPU Optimization Diagnostic Report\n")
+    # SAFE SETTINGS
+    safe_list = get_safe_settings(distro)
+    print("\nSAFE OPTIMIZATIONS (no reboot required, low risk)\n")
+    print("The following safe optimizations can be applied:\n")
+    for i, s in enumerate(safe_list, 1):
+        print(f"{i}. {s}")
+    print()
+    choice = input("Apply these safe optimizations now? (y/n): ").strip().lower()
+    if choice == "y":
+        print("\n[+] Generating and applying safe optimizations...")
+        backup_dir = BASE_DIR / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        backup_file("/etc/sysctl.conf", backup_dir)
+        generate_apply_safe_sh(distro)
+        generate_rollback_script(distro)
+        log("Applying safe optimizations via apply_safe.sh")
+        subprocess.run([str(APPLY_SAFE_SH)], check=False)
+        print("[+] Safe optimizations applied.")
+    else:
+        print("[*] Skipping safe optimizations.")
 
-    report.append("## 1. System Overview\n")
-    report.append(f"- **CPU Model:** {cpu_model or 'Unknown'}")
-    report.append(f"- **Physical Cores:** {physical}")
-    report.append(f"- **Logical Threads:** {logical}")
-    report.append(f"- **AVX2 Support:** {'Yes' if avx2 else 'No'}")
-    report.append(f"- **AVX512 Support:** {'Yes' if avx512 else 'No'}")
-    report.append(f"- **Total RAM:** {round(mem.total / 1e9, 2)} GB")
-    report.append(f"- **NUMA Nodes Detected:** {', '.join(numa_nodes) if numa_nodes else 'None / Not detected'}")
+    # UNSAFE SETTINGS
+    unsafe_list = get_unsafe_settings(vendor, sockets, virt)
+    print("\nUNSAFE OPTIMIZATIONS (may require reboot / affect stability/security)\n")
+    print("Choose how to proceed:\n")
+    print("1) Show list of unsafe optimizations")
+    print("2) Interactive mode (review/edit/apply each)")
+    print("3) Skip unsafe optimizations\n")
+    u_choice = input("Your choice (1/2/3): ").strip()
 
-    report.append("\n### Disk Devices\n")
-    for d, t in disks.items():
-        report.append(f"- **{d}:** {t}")
-
-    report.append("\n## 2. Synthetic Benchmarks\n")
-    report.append(f"- **Estimated Memory Bandwidth:** {bw:.2f} MB/s")
-    report.append(f"- **Single-thread Loop Time (10M ops):** {cpu_time:.2f} s")
-
-    if llama_bench:
-        report.append("\n### llama.cpp Benchmark\n")
-        tps = llama_bench.get("tps")
-        if tps:
-            report.append(f"- **Tokens per second (approx):** {tps:.2f}")
+    chosen_unsafe = []
+    if u_choice == "1":
+        print("\nUNSAFE OPTIMIZATIONS:\n")
+        for i, s in enumerate(unsafe_list, 1):
+            print(f"{i}. {s}")
+        print("\nNo changes applied. If you want to apply them, rerun and choose interactive mode.")
+    elif u_choice == "2":
+        print("\nEntering interactive mode for unsafe optimizations.\n")
+        for s in unsafe_list:
+            if s.startswith("NOTE:"):
+                print(f"NOTE: {s}")
+                continue
+            ans = input(f"Apply setting: {s}? (y/n/skip): ").strip().lower()
+            if ans == "y":
+                chosen_unsafe.append(s)
+            elif ans == "skip":
+                continue
+        if chosen_unsafe:
+            print("\n[+] Generating apply_unsafe.sh...")
+            backup_dir = BASE_DIR / "backups"
+            backup_dir.mkdir(exist_ok=True)
+            backup_file("/etc/default/grub", backup_dir)
+            backup_file("/etc/sysconfig/grub", backup_dir)
+            backup_file("/etc/fstab", backup_dir)
+            generate_apply_unsafe_sh(distro, chosen_unsafe)
+            log(f"Chosen unsafe settings: {chosen_unsafe}")
+            print("[!] Unsafe optimizations have been scripted in apply_unsafe.sh.")
+            print("[!] They are NOT executed automatically. Review and run manually if desired.")
+            print("[!] Some changes require a reboot to take effect.")
         else:
-            report.append("- **Tokens per second:** Not parsed, see raw output.")
-        report.append("\n<details>\n<summary>Raw llama.cpp output</summary>\n\n```text\n")
-        report.append(llama_bench["raw_output"])
-        report.append("\n```\n</details>\n")
+            print("[*] No unsafe settings selected.")
     else:
-        report.append("\n> llama.cpp benchmark not run or not configured. Set `RUN_LLAMACPP_BENCH = True` and adjust paths if you want this.\n")
+        print("[*] Skipping unsafe optimizations.")
 
-    report.append("\n## 3. Model Suitability Scores\n")
-    for model in ["7B", "13B", "14B"]:
-        report.append(f"### {model} Models")
-        report.append(f"- **Score:** {scores[model]}/100")
-        report.append("- **Reasons:**")
-        for r in reasons[model]:
-            report.append(f"  - {r}")
-        report.append("")
-
-    report.append("## 4. Optimization Targets and What to Look At\n")
-
-    report.append("### 4.1 CPU & Instruction Set\n")
-    report.append("- **Why it matters:** LLM runtimes rely heavily on vector instructions (AVX2/AVX512) for matrix multiplications.")
-    if avx512:
-        report.append("- **Status:** AVX512 available → ideal for CPU LLMs.")
-        report.append("- **Action:** Use GGUF models with `llama.cpp`, prefer Q4_K_M or Q5_K quantization.")
-    elif avx2:
-        report.append("- **Status:** AVX2 available → good performance.")
-        report.append("- **Action:** Use Q4_K_M for quality, Q3_K for speed. Stick to llama.cpp/Ollama for best CPU kernels.")
-    else:
-        report.append("- **Status:** No AVX2/AVX512 detected.")
-        report.append("- **Action:** Consider smaller models (3B–7B) and strong quantization (Q3_K). GPU offload is recommended if possible.")
-
-    report.append("\n### 4.2 RAM Capacity & Bandwidth\n")
-    report.append("- **Why it matters:** LLMs are memory-bandwidth bound; RAM size limits model size and context length.")
-    if mem.total < 12e9:
-        report.append("- **Status:** RAM is limited (<12GB).")
-        report.append("- **Action:** Prefer 7B models in Q3_K/Q4_K, keep context length around 2048, avoid large batch sizes.")
-    else:
-        report.append("- **Status:** RAM is sufficient for 13B+ models.")
-        report.append("- **Action:** 13B/14B in Q4_K_M are realistic; still keep an eye on context length and batch size.")
-
-    if bw < 3000:
-        report.append(f"- **Bandwidth:** {bw:.2f} MB/s → low.")
-        report.append("- **Action:**")
-        report.append("  - Ensure RAM is running in dual-channel mode (check BIOS and physical DIMM placement).")
-        report.append("  - Use smaller batch sizes (e.g., 128–256).")
-        report.append("  - Avoid very long context windows unless necessary.")
-    elif bw < 6000:
-        report.append(f"- **Bandwidth:** {bw:.2f} MB/s → moderate.")
-        report.append("- **Action:** Batch sizes of 256–384 are usually safe; test and adjust.")
-    else:
-        report.append(f"- **Bandwidth:** {bw:.2f} MB/s → good.")
-        report.append("- **Action:** You can push batch sizes to 384–512 for better throughput.")
-
-    report.append("\n### 4.3 Storage\n")
-    report.append("- **Why it matters:** Storage mainly affects model load time, not tokens-per-second.")
-    if "HDD" in disks.values():
-        report.append("- **Status:** HDD detected.")
-        report.append("- **Action:** Move model files to SSD/NVMe. This will significantly reduce startup time.")
-    else:
-        report.append("- **Status:** SSD/NVMe detected.")
-        report.append("- **Action:** No major changes needed; loading should be fast.")
-
-    report.append("\n### 4.4 NUMA Topology\n")
-    if numa_nodes:
-        report.append("- **Status:** Multiple NUMA nodes detected.")
-        report.append("- **Why it matters:** Cross-node memory access is slower; pinning threads and memory to a single node can improve performance.")
-        report.append("- **Action:**")
-        report.append("  - Use `numactl --cpunodebind=0 --membind=0` (or similar) when launching llama.cpp.")
-        report.append("  - Keep the LLM process on a single NUMA node if possible.")
-    else:
-        report.append("- **Status:** No NUMA nodes detected or single-node system.")
-        report.append("- **Action:** No NUMA-specific tuning required.")
-
-    report.append("\n### 4.5 OS & Power Settings\n")
-    report.append("- **Why it matters:** Power-saving modes can throttle CPU frequency and hurt LLM throughput.")
-    report.append("- **Linux:**")
-    report.append("  - Set CPU governor to performance:")
-    report.append("    ```bash\n    sudo cpupower frequency-set -g performance\n    ```")
-    report.append("- **Windows:**")
-    report.append("  - Use 'High Performance' or 'Ultimate Performance' power plan.")
-    report.append("  - Disable aggressive CPU power saving in advanced power settings.")
-
-    report.append("\n### 4.6 LLM Runtime Parameters\n")
-    report.append("- **Threads:** Set to the number of physical cores (not logical threads).")
-    report.append("- **Batch size:**")
-    report.append("  - Low bandwidth → 128–256")
-    report.append("  - Moderate bandwidth → 256–384")
-    report.append("  - High bandwidth → 384–512")
-    report.append("- **Context length:**")
-    report.append("  - Use 2048–4096 unless you truly need more; longer contexts increase memory pressure and latency.")
-    report.append("- **Quantization:**")
-    report.append("  - For speed: Q3_K / Q4_K")
-    report.append("  - For quality: Q4_K_M / Q5_K (if CPU and RAM allow)")
-    report.append("- **Preferred runtimes:** llama.cpp, Ollama, LM Studio (for GUI).")
-
-    report.append("\n---\n")
-    report.append("This report is a starting point. You can now:\n")
-    report.append("- Adjust quantization and model size based on the scores.\n")
-    report.append("- Tune batch size and context length according to memory bandwidth.\n")
-    report.append("- Apply BIOS/OS tweaks to unlock more performance.\n")
-
-    # Print report
-    print("\n".join(report))
+    print("\nDone. See:")
+    print(f"- Report: {REPORT_PATH}")
+    print(f"- Settings: {SETTINGS_PATH}")
+    print(f"- Safe script: {APPLY_SAFE_SH}")
+    print(f"- Unsafe script: {APPLY_UNSAFE_SH} (if generated)")
+    print(f"- Rollback: {ROLLBACK_SH}")
+    print(f"- Logs: {CHANGES_LOG}\n")
 
 
 if __name__ == "__main__":
