@@ -7,10 +7,13 @@ AI Server Diagnostics & Model Recommendation Tool
 - NUMA health score
 - Multi-NUMA parallel inference suggestions
 - Lightweight benchmarks (Python loop, mbw, matmul)
+- Optional ADVANCED high-performance tuning script (non-safe, dedicated servers only)
 
 Outputs:
 - ai-server-report.md
 - ai-server-tune.sh
+- ai-server-tune-advanced.sh (only when --high-performance is used)
+- rollback.txt (only when --high-performance is used)
 """
 
 import os
@@ -21,6 +24,7 @@ import shutil
 import socket
 import platform
 import subprocess
+import argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -202,7 +206,6 @@ def bench_matmul():
     """
     size = 512
     if np is None:
-        # Very small fallback to avoid huge runtimes
         size = 128
         a = [[1.0] * size for _ in range(size)]
         b = [[1.0] * size for _ in range(size)]
@@ -236,10 +239,8 @@ def estimate_tokens_per_sec(cpu, mem_bw, caps_info, gflops):
     """
     base = 1.0
 
-    # Core scaling
     base *= cpu["cores"] / 8
 
-    # ISA
     if caps_info["avx512"]:
         base *= 2.2
     elif caps_info["avx2"]:
@@ -247,27 +248,21 @@ def estimate_tokens_per_sec(cpu, mem_bw, caps_info, gflops):
     else:
         base *= 0.5
 
-    # Memory bandwidth
     if mem_bw:
         base *= min(mem_bw / 15000, 1.0)
 
-    # Matmul
     if gflops:
         base *= min(gflops / 200.0, 1.0)
 
     return max(base, 0.1)
 
 def recommend_model(cpu, mem, caps_info, mem_bw, gflops):
-    """
-    Returns recommended model size for balanced quality/performance.
-    """
     if not mem["total"]:
         return "unknown", 0.0
 
     ram_gb = mem["total"] / (1024**3)
     tps = estimate_tokens_per_sec(cpu, mem_bw, caps_info, gflops)
 
-    # Approx RAM requirements (Q4-ish)
     req = {
         "3B": 6,
         "7B": 12,
@@ -294,7 +289,6 @@ def recommend_model(cpu, mem, caps_info, mem_bw, gflops):
 # -----------------------------
 
 def parse_cpu_list(cpulist):
-    """Convert cpulist like '0-7,16-23' into a list of ints."""
     cpus = []
     if not cpulist:
         return cpus
@@ -310,12 +304,6 @@ def parse_cpu_list(cpulist):
     return sorted(cpus)
 
 def score_numa_nodes(numa, cpu_info):
-    """
-    Score NUMA nodes based on:
-    - Local memory
-    - Number of cores
-    - L3 cache per core (if available)
-    """
     results = []
 
     l3_kb = None
@@ -354,11 +342,6 @@ def score_numa_nodes(numa, cpu_info):
     return results
 
 def numa_health_score(numa):
-    """
-    Simple NUMA health score:
-    - 100: single node or perfectly balanced
-    - lower if nodes are very imbalanced
-    """
     if numa["nodes"] <= 1 or not numa["detail"]:
         return 100
 
@@ -378,12 +361,6 @@ def numa_health_score(numa):
     return int(max(0, min(100, score)))
 
 def generate_numa_pinning(best_node):
-    """
-    Produce:
-    - numactl command
-    - taskset mask
-    - recommended thread count
-    """
     cpus = best_node["cpus"]
     if not cpus:
         return None
@@ -412,9 +389,6 @@ def generate_numa_pinning(best_node):
     }
 
 def generate_multi_numa_examples(numa, cpu_info):
-    """
-    For multi-NUMA systems, suggest running one process per node.
-    """
     if numa["nodes"] <= 1:
         return []
 
@@ -433,12 +407,13 @@ def generate_multi_numa_examples(numa, cpu_info):
     return examples
 
 # -----------------------------
-# Tuning script
+# Tuning scripts
 # -----------------------------
 
-def tuning_script():
+def tuning_script_safe():
     return """#!/usr/bin/env bash
 # AI Server Tuning Script (safe defaults)
+# This script is conservative and intended for general use.
 set -e
 
 echo "Setting Transparent Huge Pages to madvise..."
@@ -460,6 +435,108 @@ done
 echo "Done. Reboot recommended."
 """
 
+def tuning_script_advanced(cpu, numa):
+    """
+    Generate a non-safe, high-performance tuning script for dedicated inference servers.
+    This script is NOT applied automatically. It must be reviewed and run manually.
+    """
+    scored = score_numa_nodes(numa, cpu) if numa["detail"] else []
+    best = scored[0] if scored else None
+    cpu_range = "X-Y"
+    if best and best["cpus"]:
+        cpu_range = f"{best['cpus'][0]}-{best['cpus'][-1]}"
+
+    script = f"""#!/usr/bin/env bash
+# AI Server High-Performance Tuning Script (ADVANCED / NON-SAFE)
+# For dedicated inference servers only. Review carefully before use.
+# Many changes require a reboot and may reduce security or stability.
+
+set -e
+
+echo "This script is ADVANCED and NON-SAFE. It is intended for dedicated inference nodes only."
+echo "Nothing is applied automatically by the diagnostic tool; you must run this manually as root."
+
+echo "------------------------------------------------------------"
+echo "KERNEL BOOT PARAMETER CHANGES (via GRUB or equivalent)"
+echo "These commands are examples. Adapt them to your distribution."
+echo "------------------------------------------------------------"
+
+echo "# Disable SMT (Hyper-Threading)"
+echo "grubby --update-kernel=ALL --args=\\"nosmt\\""
+
+echo "# Disable deep C-states"
+echo "grubby --update-kernel=ALL --args=\\"intel_idle.max_cstate=0 processor.max_cstate=1\\""
+
+echo "# Disable automatic NUMA balancing"
+echo "grubby --update-kernel=ALL --args=\\"numa_balancing=disable\\""
+
+echo "# OPTIONAL: Disable Spectre/Meltdown mitigations (security risk)"
+echo "grubby --update-kernel=ALL --args=\\"mitigations=off\\""
+
+echo "# CPU isolation for LLM cores (auto-generated range: {cpu_range})"
+echo "grubby --update-kernel=ALL --args=\\"isolcpus={cpu_range} nohz_full={cpu_range} rcu_nocbs={cpu_range}\\""
+
+echo ""
+echo "------------------------------------------------------------"
+echo "STATIC HUGEPAGES (example: 4096 x 2MB = 8GB)"
+echo "------------------------------------------------------------"
+echo "echo 4096 > /proc/sys/vm/nr_hugepages"
+echo "mkdir -p /mnt/huge"
+echo "mount -t hugetlbfs none /mnt/huge"
+
+echo ""
+echo "------------------------------------------------------------"
+echo "IRQ PINNING (move interrupts to housekeeping cores, e.g. 0-3)"
+echo "------------------------------------------------------------"
+echo 'for IRQ in /proc/irq/*/smp_affinity_list; do'
+echo '  echo 0-3 > "$IRQ"'
+echo 'done'
+
+echo ""
+echo "------------------------------------------------------------"
+echo "AFTER APPLYING:"
+echo "- Reboot the system."
+echo "- Use the NUMA-aware pinning commands from ai-server-report.md for your LLM processes."
+echo "------------------------------------------------------------"
+
+"""
+
+    rollback = f"""ROLLBACK INSTRUCTIONS (HIGH-PERFORMANCE MODE)
+
+1. Kernel boot parameters
+   - Remove the following from your kernel command line (GRUB or equivalent):
+     - nosmt
+     - intel_idle.max_cstate=0
+     - processor.max_cstate=1
+     - numa_balancing=disable
+     - mitigations=off (if used)
+     - isolcpus={cpu_range}
+     - nohz_full={cpu_range}
+     - rcu_nocbs={cpu_range}
+   - Update your bootloader configuration.
+   - Reboot.
+
+2. Hugepages
+   - To clear static hugepages:
+     echo 0 > /proc/sys/vm/nr_hugepages
+   - Unmount hugetlbfs if mounted:
+     umount /mnt/huge
+
+3. IRQ affinity
+   - To reset IRQ affinity, you can reboot, or manually restore defaults
+     using distribution-specific tools (e.g., irqbalance).
+
+4. SMT / C-states / mitigations
+   - Once kernel parameters are removed and the system is rebooted,
+     SMT, C-states, and mitigations return to their defaults.
+
+NOTE:
+- These changes are advanced and should only be used on dedicated inference servers.
+- Always test on non-production systems first.
+"""
+
+    return script, rollback
+
 # -----------------------------
 # Report generation
 # -----------------------------
@@ -476,6 +553,7 @@ def generate_report(
     gflops,
     model,
     tps,
+    high_perf_requested: bool,
 ):
     lines = []
     lines.append("# AI Server Diagnostic Report")
@@ -537,7 +615,6 @@ def generate_report(
         lines.append("- No NVIDIA GPU detected")
     lines.append("")
 
-    # NUMA-aware pinning
     if numa["nodes"] > 0 and numa["detail"]:
         lines.append("## NUMA-aware CPU pinning recommendation")
         best_nodes = score_numa_nodes(numa, cpu)
@@ -558,7 +635,6 @@ def generate_report(
         lines.append("- Single-node system; NUMA pinning not required.")
         lines.append("")
 
-    # Multi-NUMA parallel inference
     if numa["nodes"] > 1:
         lines.append("## Multi-NUMA parallel inference (advanced)")
         lines.append(
@@ -577,12 +653,22 @@ def generate_report(
         lines.append("- Not applicable (single NUMA node).")
         lines.append("")
 
-    lines.append("## Tuning suggestions")
+    lines.append("## Tuning suggestions (safe)")
     lines.append("- Set Transparent Huge Pages to `madvise`.")
     lines.append("- Set CPU governor to `performance` on dedicated inference nodes.")
     lines.append("- Set `vm.swappiness` to around 10.")
     lines.append("- Pin inference to a single NUMA node for best locality.")
     lines.append("- Use a real LLM benchmark (e.g., llama.cpp tokens/sec) to validate these estimates.")
+    lines.append("")
+
+    lines.append("## Advanced High-Performance Mode (optional, non-safe)")
+    if high_perf_requested:
+        lines.append("- You requested generation of `ai-server-tune-advanced.sh` and `rollback.txt`.")
+    else:
+        lines.append("- To generate an advanced high-performance tuning script, run this tool with `--high-performance`.")
+    lines.append("- This mode is intended ONLY for dedicated inference servers.")
+    lines.append("- It includes SMT disable, deep C-state disable, NUMA balancing off, CPU isolation, hugepages, and IRQ pinning.")
+    lines.append("- Changes are NOT applied automatically; you must review and run the script manually as root.")
     lines.append("")
 
     return "\n".join(lines)
@@ -592,6 +678,16 @@ def generate_report(
 # -----------------------------
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="AI Server Diagnostics & Model Recommendation Tool"
+    )
+    parser.add_argument(
+        "--high-performance",
+        action="store_true",
+        help="Generate an additional ADVANCED / NON-SAFE tuning script for dedicated inference servers.",
+    )
+    args = parser.parse_args()
+
     basic = get_basic_info()
     cpu = get_cpu_info()
     mem = get_memory()
@@ -617,14 +713,24 @@ def main():
         gflops,
         model,
         tps,
+        high_perf_requested=args.high_performance,
     )
 
     Path("ai-server-report.md").write_text(report)
-    Path("ai-server-tune.sh").write_text(tuning_script())
+    Path("ai-server-tune.sh").write_text(tuning_script_safe())
     Path("ai-server-tune.sh").chmod(0o755)
 
     print("Report written to ai-server-report.md")
-    print("Tuning script written to ai-server-tune.sh")
+    print("Safe tuning script written to ai-server-tune.sh")
+
+    if args.high_performance:
+        adv_script, rollback = tuning_script_advanced(cpu, numa)
+        Path("ai-server-tune-advanced.sh").write_text(adv_script)
+        Path("ai-server-tune-advanced.sh").chmod(0o755)
+        Path("rollback.txt").write_text(rollback)
+        print("ADVANCED high-performance tuning script written to ai-server-tune-advanced.sh")
+        print("Rollback instructions written to rollback.txt")
+        print("NOTE: These advanced optimizations are NON-SAFE and intended only for dedicated inference servers.")
 
 if __name__ == "__main__":
     main()
